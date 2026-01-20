@@ -4,11 +4,11 @@ import torch
 import torchaudio
 import numpy as np
 import uuid
-import gc  # 引入 gc 进行垃圾回收
+import gc
 import folder_paths
-from transformers import BitsAndBytesConfig
+
 # ----------------------------
-# 添加本地 HeartLib 到路径
+# Add Local HeartLib to Path
 # ----------------------------
 current_dir = os.path.dirname(os.path.abspath(__file__))
 util_dir = os.path.join(current_dir, "util")
@@ -16,12 +16,12 @@ if util_dir not in sys.path:
     sys.path.insert(0, util_dir)
 
 # ----------------------------
-# 路径配置
+# Path Configuration
 # ----------------------------
 MODEL_BASE_DIR = os.path.join(folder_paths.models_dir, "HeartMuLa")
 
 # ----------------------------
-# 全局模型管理器
+# Global Model Manager
 # ----------------------------
 class HeartMuLaModelManager:
     _instance = None
@@ -35,33 +35,24 @@ class HeartMuLaModelManager:
         return cls._instance
 
     def get_gen_pipeline(self, version="3B"):
-        if version not in self._gen_pipes:
-            print(f"[HeartMuLa] 正在加载生成管线 (版本: {version}) 于 {self._device}...")
+        if version not in self._gen_pipes or self._gen_pipes[version] is None:
+            print(f"[HeartMuLa] Loading Generation Pipeline (Version: {version}) on {self._device}...")
             from heartlib import HeartMuLaGenPipeline
-            from transformers import BitsAndBytesConfig
             
-            # 配置 4-bit 量化
-            bnb_config = BitsAndBytesConfig(
-                load_in_4bit=True,
-                bnb_4bit_quant_type="nf4",
-                bnb_4bit_compute_dtype=torch.float16,
-                bnb_4bit_use_double_quant=True,
-            )
-
             self._gen_pipes[version] = HeartMuLaGenPipeline.from_pretrained(
                 MODEL_BASE_DIR,
                 device=self._device,
-                dtype=torch.float16,
+                # 🔧 ORIGINALE: Usa torch.bfloat16
+                dtype=torch.bfloat16,
                 version=version,
-                bnb_config=bnb_config,
             )
-            print(f"[HeartMuLa] 生成管线 ({version}) 就绪。")
+            print(f"[HeartMuLa] Generation Pipeline ({version}) Ready.")
             
         return self._gen_pipes[version]
 
     def get_transcribe_pipeline(self):
         if self._transcribe_pipe is None:
-            print(f"[HeartMuLa] 正在加载转录管线 于 {self._device}...")
+            print(f"[HeartMuLa] Loading Transcription Pipeline on {self._device}...")
             from heartlib import HeartTranscriptorPipeline
             
             self._transcribe_pipe = HeartTranscriptorPipeline.from_pretrained(
@@ -69,12 +60,32 @@ class HeartMuLaModelManager:
                 device=self._device,
                 dtype=torch.float16,
             )
-            print("[HeartMuLa] 转录管线 就绪。")
+            print("[HeartMuLa] Transcription Pipeline Ready.")
             
         return self._transcribe_pipe
 
+    def unload_gen_pipeline(self, version):
+        """Unload specific generation pipeline to free VRAM"""
+        if version in self._gen_pipes and self._gen_pipes[version] is not None:
+            print(f"[HeartMuLa] Unloading Generation Pipeline ({version}) to free VRAM...")
+            del self._gen_pipes[version]
+            self._gen_pipes[version] = None
+            torch.cuda.synchronize() # Wait for GPU ops to finish
+            torch.cuda.empty_cache()
+            gc.collect()
+
+    def unload_transcribe_pipeline(self):
+        """Unload transcription pipeline to free VRAM"""
+        if self._transcribe_pipe is not None:
+            print("[HeartMuLa] Unloading Transcription Pipeline to free VRAM...")
+            del self._transcribe_pipe
+            self._transcribe_pipe = None
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+            gc.collect()
+
 # ----------------------------
-# 节点: 音乐生成器
+# Node: Music Generator
 # ----------------------------
 class HeartMuLa_Generate:
     @classmethod
@@ -84,10 +95,14 @@ class HeartMuLa_Generate:
                 "lyrics": ("STRING", {"multiline": True, "placeholder": "[Verse]\n..."}),
                 "tags": ("STRING", {"multiline": True, "placeholder": "piano,happy,wedding"}),
                 "version": (["3B", "7B"], {"default": "3B"}),
-                "max_audio_length_ms": ("INT", {"default": 240000, "min": 10000, "max": 600000, "step": 10000}),
+                # Optimized Default: 60s is safer for 16GB VRAM than 240s
+                "max_audio_length_ms": ("INT", {"default": 60000, "min": 10000, "max": 600000, "step": 10000}),
                 "topk": ("INT", {"default": 50, "min": 1, "max": 200, "step": 1}),
                 "temperature": ("FLOAT", {"default": 1.0, "min": 0.1, "max": 2.0, "step": 0.1}),
                 "cfg_scale": ("FLOAT", {"default": 1.5, "min": 1.0, "max": 10.0, "step": 0.1}),
+                "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
+                "control_seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
+                "unload_model_after_run": ("BOOLEAN", {"default": True}), # MEMORY OPT
             }
         }
 
@@ -96,7 +111,15 @@ class HeartMuLa_Generate:
     FUNCTION = "generate"
     CATEGORY = "HeartMuLa"
 
-    def generate(self, lyrics, tags, version, max_audio_length_ms, topk, temperature, cfg_scale):
+    def generate(self, lyrics, tags, version, max_audio_length_ms, topk, temperature, cfg_scale, seed, control_seed, unload_model_after_run):
+        # --- SEED HANDLING ---
+        if seed > 0:
+            torch.manual_seed(seed)
+        elif control_seed > 0:
+            torch.manual_seed(control_seed)
+        else:
+            print("[HeartMuLa] Random Seed used.")
+        
         manager = HeartMuLaModelManager()
         pipe = manager.get_gen_pipeline(version)
 
@@ -105,7 +128,7 @@ class HeartMuLa_Generate:
         filename = f"heartmula_gen_{uuid.uuid4().hex}.mp3"
         out_path = os.path.join(output_dir, filename)
 
-        # --- 生成 ---
+        # --- GENERATION ---
         with torch.no_grad():
             pipe(
                 {"lyrics": lyrics, "tags": tags},
@@ -116,25 +139,24 @@ class HeartMuLa_Generate:
                 cfg_scale=cfg_scale,
             )
         
-        # --- 内存清理 ---
-        # 生成完成后立即清理内存
+        # --- MEMORY CLEANUP (Optimized for 16GB) ---
         torch.cuda.empty_cache()
         gc.collect()
 
-        # 加载结果回 ComfyUI
+        # --- UNLOAD LOGIC ---
+        if unload_model_after_run:
+            manager.unload_gen_pipeline(version)
+
+        # Load result back for ComfyUI
         waveform, sample_rate = torchaudio.load(out_path)
         
-        print(f"[HeartMuLa Gen] 加载形状: {waveform.shape}")
         if waveform.ndim == 1:
             waveform = waveform.unsqueeze(0) 
         
-        # 显式转换为 float32
         waveform = waveform.float()
             
         if waveform.ndim == 2:
             waveform = waveform.unsqueeze(0)
-            
-        print(f"[HeartMuLa Gen] 输出形状: {waveform.shape}")
 
         audio_output = {
             "waveform": waveform,
@@ -144,7 +166,7 @@ class HeartMuLa_Generate:
         return (audio_output, out_path)
 
 # ----------------------------
-# 节点: 歌词转录器
+# Node: Lyrics Transcriber
 # ----------------------------
 class HeartMuLa_Transcribe:
     @classmethod
@@ -155,6 +177,7 @@ class HeartMuLa_Transcribe:
                 "temperature_tuple": ("STRING", {"default": "0.0,0.1,0.2,0.4"}),
                 "no_speech_threshold": ("FLOAT", {"default": 0.4, "min": 0.0, "max": 1.0, "step": 0.05}),
                 "logprob_threshold": ("FLOAT", {"default": -1.0, "min": -5.0, "max": 5.0, "step": 0.1}),
+                "unload_model_after_run": ("BOOLEAN", {"default": True}), # MEMORY OPT
             }
         }
 
@@ -163,7 +186,7 @@ class HeartMuLa_Transcribe:
     FUNCTION = "transcribe"
     CATEGORY = "HeartMuLa"
 
-    def transcribe(self, audio_input, temperature_tuple, no_speech_threshold, logprob_threshold):
+    def transcribe(self, audio_input, temperature_tuple, no_speech_threshold, logprob_threshold, unload_model_after_run):
         # --- PRE-PROCESSING ---
         if isinstance(audio_input, dict):
             waveform = audio_input["waveform"]
@@ -173,19 +196,13 @@ class HeartMuLa_Transcribe:
             if isinstance(waveform, np.ndarray):
                  waveform = torch.from_numpy(waveform)
         
-        print(f"[HeartMuLa Transcribe] Input Shape: {waveform.shape}, Dtype: {waveform.dtype}")
-
         if waveform.ndim == 3:
             waveform = waveform.squeeze(0)
         elif waveform.ndim == 1:
             waveform = waveform.unsqueeze(0)
         
-        # --- CRITICAL: Convert to Float32 before saving ---
         if waveform.dtype != torch.float32:
-            print("[HeartMuLa Transcribe] Casting to float32 for WAV save...")
             waveform = waveform.float()
-        
-        print(f"[HeartMuLa Transcribe] Saving Shape: {waveform.shape}, Dtype: {waveform.dtype}")
         
         output_dir = folder_paths.get_temp_directory()
         os.makedirs(output_dir, exist_ok=True)
@@ -217,9 +234,12 @@ class HeartMuLa_Transcribe:
             )
 
         # --- MEMORY CLEANUP ---
-        # Clear memory immediately after transcription finishes
         torch.cuda.empty_cache()
         gc.collect()
+
+        # --- UNLOAD LOGIC ---
+        if unload_model_after_run:
+            manager.unload_transcribe_pipeline()
 
         # --- POST-PROCESSING ---
         if os.path.exists(temp_path):
@@ -229,7 +249,7 @@ class HeartMuLa_Transcribe:
         return (text,)
 
 # ----------------------------
-# 节点映射
+# Node Mappings
 # ----------------------------
 NODE_CLASS_MAPPINGS = {
     "HeartMuLa_Generate": HeartMuLa_Generate,
