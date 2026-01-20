@@ -43,6 +43,9 @@ class HeartMuLaGenPipeline(Pipeline):
         self.muq_mulan = muq_mulan
         self.text_tokenizer = text_tokenizer
         self.config = config
+        # 🔧 AGGIUNTO: Salva dtype come attributo della classe
+        self.dtype = dtype
+        self.device = device
 
         self._parallel_number = audio_codec.config.num_quantizers + 1
         self._muq_dim = model.config.muq_dim
@@ -86,6 +89,7 @@ class HeartMuLaGenPipeline(Pipeline):
         ref_audio = inputs.get("ref_audio", None)
         if ref_audio is not None:
             raise NotImplementedError("ref_audio is not supported yet.")
+        # 🔧 ORA FUNZIONA: self.dtype è un attributo della classe
         muq_embed = torch.zeros([self._muq_dim], dtype=self.dtype)
         muq_idx = len(tags_ids)
 
@@ -227,9 +231,15 @@ class HeartMuLaGenPipeline(Pipeline):
         if os.path.exists(
             heartmula_path := os.path.join(pretrained_path, f"HeartMuLa-oss-{version}")
         ):
+            # 🔧 RIMOSSO 'dtype=dtype' perché HeartMuLa.__init__ non lo accetta
             heartmula = HeartMuLa.from_pretrained(
-                heartmula_path, dtype=dtype, quantization_config=bnb_config
+                heartmula_path, 
+                # dtype=dtype,  # <-- QUESTA RIGA È STATA RIMMOSSA
+                quantization_config=bnb_config
             )
+            # 🔧 AGGIUNTO: Converti il modello in bfloat16 dopo il caricamento
+            if dtype == torch.bfloat16:
+                heartmula = heartmula.to(dtype)
         else:
             raise FileNotFoundError(
                 f"期望在 {heartmula_path} 找到 HeartMuLa 检查点但未找到。请检查您的文件夹 {pretrained_path}。"
